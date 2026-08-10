@@ -5,10 +5,12 @@ import hashlib
 import io
 import ipaddress
 import logging
+import lzma
 import os
 import subprocess as sp
 import sys
 from collections import namedtuple
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -22,6 +24,7 @@ vrp_tuple_fields = ['prefix', 'asn', 'max_length']
 VRP = namedtuple('VRP', vrp_tuple_fields)
 
 RPKIVIEWS_HOST = 'https://dango.attn.jp'
+RIPENCC_HOST = 'https://ftp.ripe.net'
 RPKIFLUTTER_VP = 'routinator-3.rpki.ripe.net'
 
 
@@ -363,6 +366,132 @@ class RPKIViews(RPKIHistory):
         """, insert_data)
 
 
+class RIPENCCDaily(RPKIViews):
+    """Fetch VRPs from the RIPE NCC RPKI archive at ftp.ripe.net.
+
+    In contrast to RPKIViews, this archive contains exactly one dump per day, stored
+    under a YYYY/MM/DD path with the fixed file name roas.csv.xz. Since the file name
+    carries no time information, the dump is treated as being taken at midnight UTC of
+    its directory date.
+
+    The VRP diffing logic of RPKIViews is reused as-is.
+    """
+
+    # Candidate column names per VRP field, in order of preference. The archive has used
+    # the RIPE NCC validator header (URI,ASN,IP Prefix,Max Length,Not Before,Not After)
+    # for years, but rpki-client and Routinator emit slightly different headers, so
+    # resolve columns by name instead of by position.
+    CSV_COLUMNS = {
+        'asn': ('asn',),
+        'prefix': ('ip prefix', 'prefix'),
+        'max_length': ('max length', 'maxlength', 'max_length'),
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.url_fmt = os.path.join(RIPENCC_HOST, 'rpki/ripencc.tal/%Y/%m/%d/')
+        self.file_fmt = 'roas.csv.xz'
+
+    def build_file_url(self, ts: datetime) -> str:
+        return os.path.join(ts.strftime(self.url_fmt), ts.strftime(self.file_fmt))
+
+    def get_new_file_url(self) -> None:
+        """Get the URL of the newest available file.
+
+        The file name is fixed, so there is no need to scrape the directory listing. Try
+        the current day first and fall back to the previous day, since the dump for the
+        current day is not necessarily published yet.
+        """
+        curr_ts = datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        for ts in (curr_ts, curr_ts - timedelta(days=1)):
+            file_url = self.build_file_url(ts)
+            r = requests.head(file_url)
+            if r.ok:
+                self.new_ts = ts
+                self.new_file_url = file_url
+                return
+            logging.info(f'No file available at {file_url} ({r.status_code})')
+        logging.error(f'Failed to get latest file for {curr_ts.date()} or the day before.')
+
+    def fetch_and_read_specific_file(self, ts: datetime) -> None:
+        """Fetch and process the dump of the day of the specified timestamp.
+
+        Only the date part of the timestamp is significant; the time is normalized to
+        midnight UTC so that the recorded dump time matches the automatic path.
+        """
+        self.new_ts = ts.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        self.new_file_url = self.build_file_url(self.new_ts)
+        self.fetch_and_read_file()
+
+    def verify_file_integrity(self) -> bool:
+        """Compare the file against its .sha256 sidecar.
+
+        Return True if the file should be discarded, i.e., if verification failed.
+
+        The sidecar uses the coreutils format ("<hex digest>  <file name>"), which
+        differs from the base64 SHA256 manifest used by RPKIViews.
+        """
+        logging.info('Verifying file integrity.')
+        hash_file_url = f'{self.new_file_url}.sha256'
+        r = requests.get(hash_file_url)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            logging.error(f'Failed to fetch sha256 file: {e}')
+            return True
+        line_split = r.text.split()
+        if not line_split:
+            logging.error(f'Empty sha256 file: {hash_file_url}')
+            return True
+        expected_checksum = line_split[0].lower()
+        logging.info(f'Expected checksum: {expected_checksum}')
+        actual_checksum = hashlib.sha256(self.new_file_content).hexdigest()
+        logging.info(f'  Actual checksum: {actual_checksum}')
+        if actual_checksum == expected_checksum:
+            logging.info('Verification OK')
+            return False
+        logging.info('Verification FAIL')
+        return True
+
+    def resolve_csv_columns(self, fieldnames: Sequence[str] | None) -> dict:
+        """Map VRP field names to the matching column names of the CSV header."""
+        if not fieldnames:
+            raise RuntimeError('Missing CSV header.')
+        normalized = {name.strip().lower(): name for name in fieldnames if name}
+        columns = dict()
+        for field, candidates in self.CSV_COLUMNS.items():
+            for candidate in candidates:
+                if candidate in normalized:
+                    columns[field] = normalized[candidate]
+                    break
+            else:
+                raise RuntimeError(f'Failed to find a column for "{field}" in CSV header: {fieldnames}')
+        return columns
+
+    def read_file(self) -> None:
+        """Read the contents of the downloaded file and parse VRP entries."""
+        logging.info('Reading file')
+        content = lzma.decompress(self.new_file_content).decode()
+        reader = csv.DictReader(content.splitlines())
+        columns = self.resolve_csv_columns(reader.fieldnames)
+        malformed_lines = 0
+        for line in reader:
+            try:
+                asn = int(line[columns['asn']].removeprefix('AS'))
+                prefix = ipaddress.ip_network(line[columns['prefix']])
+                max_length = int(line[columns['max_length']])
+            except (AttributeError, TypeError, ValueError) as e:
+                malformed_lines += 1
+                logging.warning(f'Ignoring malformed line: {line} ({e})')
+                continue
+            self.new_vrps.add(VRP(prefix, asn, max_length))
+        if malformed_lines:
+            logging.warning(f'Ignored {malformed_lines} malformed lines.')
+        if not self.new_vrps:
+            raise RuntimeError('Read no VRPs from file.')
+        logging.info(f'Read {len(self.new_vrps)} unique VRPs from file')
+
+
 class RPKIFlutter(RPKIHistory):
     def __init__(self) -> None:
         super().__init__()
@@ -515,13 +644,15 @@ if __name__ == '__main__':
     parser.add_argument('command', choices=['init', 'update'])
     parser.add_argument('-t', '--timestamp', help='fetch file for specific timestamp (YYYYMMDDThhmmss)')
     parser.add_argument('-m', '--mode',
-                        choices=['rpkiviews', 'rpkiflutter'],
+                        choices=['rpkiviews', 'ripencc', 'rpkiflutter'],
                         default='rpkiviews',
                         help='data source')
     args = parser.parse_args()
     mode = args.mode
     if mode == 'rpkiviews':
         rpki = RPKIViews()
+    elif mode == 'ripencc':
+        rpki = RIPENCCDaily()
     else:
         rpki = RPKIFlutter()
     command = args.command
