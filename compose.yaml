@@ -1,6 +1,6 @@
 services:
   database:
-    image: postgres:17.5
+    image: postgres:17.11
     restart: unless-stopped
     shm_size: 2gb
     command: -c config_file=/etc/postgresql/postgresql.conf
@@ -30,6 +30,19 @@ services:
       database:
         condition: service_healthy
     secrets:
+      - postgres-ro-pw
+
+  db-cli:
+    build: ./db_scripts
+    env_file:
+      - ./connection.env
+    volumes:
+      - ./log:/log
+    depends_on:
+      database:
+        condition: service_healthy
+    secrets:
+      - postgres-pw
       - postgres-ro-pw
 
   init-db:

@@ -1,7 +1,6 @@
 import ipaddress
 import os
-from datetime import datetime, timezone
-from typing import Tuple
+from datetime import UTC, datetime
 
 import falcon
 import psycopg
@@ -35,26 +34,32 @@ def rows_to_vrp(c: psycopg.Cursor) -> list:
 
 
 def get_covering_vrps_for_prefix_at_time(c: psycopg.Cursor, prefix, timestamp: datetime) -> list:
-    c.execute("""
+    c.execute(
+        """
         SELECT * FROM vrps
         WHERE prefix >>= %s
         AND visible @> %s
-    """, (prefix, timestamp))
+    """,
+        (prefix, timestamp),
+    )
     return rows_to_vrp(c)
 
 
-def get_covering_vrps_for_prefix_within_timerange(c: psycopg.Cursor,
-                                                  prefix,
-                                                  timerange: Range) -> list:
+def get_covering_vrps_for_prefix_within_timerange(
+    c: psycopg.Cursor, prefix, timerange: Range
+) -> list:
     """Return all covering VRPs for the specified prefix whose visible range overlaps
     with the specified timerange.
     """
-    c.execute("""
+    c.execute(
+        """
         SELECT * FROM vrps
         WHERE prefix >>= %s
         AND visible && %s
         ORDER BY visible
-    """, (prefix, timerange))
+    """,
+        (prefix, timerange),
+    )
     return rows_to_vrp(c)
 
 
@@ -82,19 +87,21 @@ def get_rpki_status(c: psycopg.Cursor, prefix, timestamp: datetime, asn: int) ->
             'reason': {
                 'code': 'moreSpecific',
                 'description': 'Covering VRP with matching origin ASN found, but queried prefix is more specific '
-                'than maxLength attribute allows.'
-            }
+                'than maxLength attribute allows.',
+            },
         }
     return {
         'status': 'Invalid',
         'reason': {
             'code': 'noMatchingOrigin',
-            'description': 'No covering VRP with matching origin ASN found.'
-        }
+            'description': 'No covering VRP with matching origin ASN found.',
+        },
     }
 
 
-def get_available_dump_time_range(c: psycopg.Cursor) -> Tuple[datetime, datetime] | Tuple[None, None]:
+def get_available_dump_time_range(
+    c: psycopg.Cursor,
+) -> tuple[datetime, datetime] | tuple[None, None]:
     """Get the latest dump time as datetime from the database."""
     c.execute('SELECT earliest, latest FROM dump_time_range')
     res = c.fetchone()
@@ -109,23 +116,21 @@ def parse_timestamp(timestamp: str, param_name: str) -> datetime:
     corresponding datetime.
     """
     try:
-        return datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+        return datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%S').replace(tzinfo=UTC)
     except ValueError:
         pass
     try:
-        return datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
+        return datetime.fromtimestamp(int(timestamp), tz=UTC)
     except ValueError:
-        raise falcon.HTTPInvalidParam('Timestamp has to be in epoch or %Y-%m-%dT%H:%M:%S format.', param_name)
+        raise falcon.HTTPInvalidParam(
+            'Timestamp has to be in epoch or %Y-%m-%dT%H:%M:%S format.', param_name
+        )
 
 
 class VRPResource:
     def __init__(self) -> None:
         self.conn = psycopg.connect(
-            host=db_host,
-            dbname=db_dbname,
-            user=db_user,
-            password=db_password,
-            autocommit=True
+            host=db_host, dbname=db_dbname, user=db_user, password=db_password, autocommit=True
         )
 
     def on_get(self, req: falcon.Request, resp: falcon.Response):
@@ -142,37 +147,55 @@ class VRPResource:
         except ValueError as e:
             raise falcon.HTTPInvalidParam(str(e), 'prefix')
 
-        if (req.has_param('timestamp')
-            and (req.has_param('timestamp__gte') or
-                 req.has_param('timestamp__lte'))):
-            raise falcon.HTTPBadRequest(description='timestamp and timestamp__gte/lte parameters are exclusive.')
+        if req.has_param('timestamp') and (
+            req.has_param('timestamp__gte') or req.has_param('timestamp__lte')
+        ):
+            raise falcon.HTTPBadRequest(
+                description='timestamp and timestamp__gte/lte parameters are exclusive.'
+            )
 
         with self.conn.cursor() as c:
             earliest, latest = get_available_dump_time_range(c)
             if req.has_param('timestamp'):
                 timestamp = parse_timestamp(req.get_param('timestamp', required=True), 'timestamp')
                 if earliest is None or timestamp < earliest or timestamp > latest:
-                    raise falcon.HTTPNotFound(description='Requested timestamp is outside of available data.')
+                    raise falcon.HTTPNotFound(
+                        description='Requested timestamp is outside of available data.'
+                    )
                 vrps = get_covering_vrps_for_prefix_at_time(c, parsed_prefix, timestamp)
             elif req.has_param('timestamp__gte') or req.has_param('timestamp__lte'):
                 timestamp_start = None
                 if req.has_param('timestamp__gte'):
-                    timestamp_start = parse_timestamp(req.get_param('timestamp__gte', required=True), 'timestamp__gte')
+                    timestamp_start = parse_timestamp(
+                        req.get_param('timestamp__gte', required=True), 'timestamp__gte'
+                    )
                 timestamp_end = None
                 if req.has_param('timestamp__lte'):
-                    timestamp_end = parse_timestamp(req.get_param('timestamp__lte', required=True), 'timestamp__lte')
+                    timestamp_end = parse_timestamp(
+                        req.get_param('timestamp__lte', required=True), 'timestamp__lte'
+                    )
 
-                if (earliest is None
+                if (
+                    earliest is None
                     or (timestamp_start and timestamp_start < earliest)
-                        or (timestamp_end and timestamp_end > latest)):
-                    raise falcon.HTTPNotFound(description='Requested timerange is outside of available data.')
+                    or (timestamp_end and timestamp_end > latest)
+                ):
+                    raise falcon.HTTPNotFound(
+                        description='Requested timerange is outside of available data.'
+                    )
+                if timestamp_start and timestamp_end and timestamp_end < timestamp_start:
+                    raise falcon.HTTPBadRequest(
+                        description='Requested end time is before start time.'
+                    )
 
                 timerange = Range(timestamp_start, timestamp_end, bounds='[]')
                 vrps = get_covering_vrps_for_prefix_within_timerange(c, parsed_prefix, timerange)
             else:
                 timestamp = latest
                 if timestamp is None:
-                    raise falcon.HTTPInternalServerError(description='Failed to get latest dump time.')
+                    raise falcon.HTTPInternalServerError(
+                        description='Failed to get latest dump time.'
+                    )
                 vrps = get_covering_vrps_for_prefix_at_time(c, parsed_prefix, timestamp)
             # Format for JSON serialization.
             for vrp in vrps:
@@ -184,19 +207,14 @@ class VRPResource:
                     visible_to = latest.isoformat()
                 else:
                     visible_to = visible_range.upper.isoformat()
-                vrp['visible'] = {'from': vrp['visible'].lower.isoformat(),
-                                  'to': visible_to}
+                vrp['visible'] = {'from': vrp['visible'].lower.isoformat(), 'to': visible_to}
             resp.media = vrps
 
 
 class StatusResource:
     def __init__(self) -> None:
         self.conn = psycopg.connect(
-            host=db_host,
-            dbname=db_dbname,
-            user=db_user,
-            password=db_password,
-            autocommit=True
+            host=db_host, dbname=db_dbname, user=db_user, password=db_password, autocommit=True
         )
 
     def on_get(self, req: falcon.Request, resp: falcon.Response):
@@ -218,11 +236,15 @@ class StatusResource:
             if req.has_param('timestamp'):
                 timestamp = parse_timestamp(req.get_param('timestamp', required=True), 'timestamp')
                 if earliest is None or timestamp < earliest or timestamp > latest:
-                    raise falcon.HTTPNotFound(description='Requested timestamp is outside of available data.')
+                    raise falcon.HTTPNotFound(
+                        description='Requested timestamp is outside of available data.'
+                    )
             else:
                 timestamp = latest
                 if timestamp is None:
-                    raise falcon.HTTPInternalServerError(description='Failed to get latest dump time.')
+                    raise falcon.HTTPInternalServerError(
+                        description='Failed to get latest dump time.'
+                    )
 
             resp.media = get_rpki_status(c, parsed_prefix, timestamp, asn)
 
@@ -230,24 +252,26 @@ class StatusResource:
 class MetadataResource:
     def __init__(self) -> None:
         self.conn = psycopg.connect(
-            host=db_host,
-            dbname=db_dbname,
-            user=db_user,
-            password=db_password,
-            autocommit=True
+            host=db_host, dbname=db_dbname, user=db_user, password=db_password, autocommit=True
         )
         self.MAX_PAGE_SIZE = 10000
 
     def on_get(self, req: falcon.Request, resp: falcon.Response):
         """Return a list of dump timestamps and associated metadata."""
         # We construct the query dynamically depending on which parameters the user specified.
-        query_parts = [sql.SQL('SELECT dump_time, deleted_vrps, unchanged_vrps, new_vrps FROM metadata ')]
+        query_parts = [
+            sql.SQL(
+                'SELECT dump_time, ingest_time, deleted_vrps, unchanged_vrps, new_vrps, vp, vp_type FROM metadata_view '
+            )
+        ]
         # Parameters for the SQL query. Length needs to match the number of
         # sql.Placeholder() instances we added in query_parts.
         query_parameters = list()
         # Gather parameters for the URI pointing to the next page.
         uri_parameters = list()
         connector = sql.SQL('WHERE ')
+        timestamp_start = None
+        timestamp_end = None
         if req.has_param('timestamp__gte'):
             timestamp_gte_param = req.get_param('timestamp__gte', required=True)
             timestamp_start = parse_timestamp(timestamp_gte_param, 'timestamp__gte')
@@ -258,20 +282,30 @@ class MetadataResource:
             connector = sql.SQL('AND ')
         if req.has_param('timestamp__lte'):
             timestamp_lte_param = req.get_param('timestamp__lte', required=True)
-            timestamp_end = parse_timestamp(req.get_param('timestamp__lte', required=True), 'timestamp__lte')
+            timestamp_end = parse_timestamp(
+                req.get_param('timestamp__lte', required=True), 'timestamp__lte'
+            )
             query_parts.append(connector)
             query_parts.append(sql.SQL('dump_time <= {} ').format(sql.Placeholder()))
             query_parameters.append(timestamp_end)
             uri_parameters.append(f'timestamp__lte={timestamp_lte_param}')
 
+        if timestamp_start and timestamp_end and timestamp_end < timestamp_start:
+            raise falcon.HTTPBadRequest(description='Requested end time is before start time.')
+
         page_size = self.MAX_PAGE_SIZE
         if req.has_param('page_size'):
-            page_size = req.get_param_as_int('page_size', required=True, min_value=1, max_value=self.MAX_PAGE_SIZE)
+            page_size = req.get_param_as_int(
+                'page_size', required=True, min_value=1, max_value=self.MAX_PAGE_SIZE
+            )
         page = 1
         if req.has_param('page'):
             page = req.get_param_as_int('page', required=True, min_value=1)
-        query_parts.append(sql.SQL('ORDER BY dump_time LIMIT {} OFFSET {}')
-                           .format(sql.Placeholder(), sql.Placeholder()))
+        query_parts.append(
+            sql.SQL('ORDER BY dump_time LIMIT {} OFFSET {}').format(
+                sql.Placeholder(), sql.Placeholder()
+            )
+        )
         query_parameters.append(page_size)
         query_parameters.append((page - 1) * page_size)
         uri_parameters.append(f'page_size={page_size}')
@@ -281,22 +315,23 @@ class MetadataResource:
             c.execute(sql.Composed(query_parts), query_parameters)
             formatted_results = [
                 {
-                    'timestamp': e[0].isoformat(),
-                    'deleted_vrps': e[1],
-                    'unchanged_vrps': e[2],
-                    'new_vrps': e[3]
-                } for e in c.fetchall()
+                    'dump_timestamp': e[0].isoformat(),
+                    'ingest_timestamp': e[1].isoformat(),
+                    'deleted_vrps': e[2],
+                    'unchanged_vrps': e[3],
+                    'new_vrps': e[4],
+                    'vp': e[5],
+                    'vp_type': e[6],
+                }
+                for e in c.fetchall()
             ]
             # Only return a next URI if there are results left.
             # This creates one unnecessary next_uri if the last page fits the
             # remaining results exactly, but better than nothing.
-            next_uri = str()
+            next_uri = ''
             if len(formatted_results) == page_size:
                 next_uri = falcon.uri.encode(f'{req.uri}?' + '&'.join(uri_parameters))
-            resp.media = {
-                'next': next_uri,
-                'results': formatted_results
-            }
+            resp.media = {'next': next_uri, 'results': formatted_results}
 
 
 def default_sink(req: falcon.Request, resp: falcon.Response, **kwargs):
@@ -304,10 +339,7 @@ def default_sink(req: falcon.Request, resp: falcon.Response, **kwargs):
     raise falcon.HTTPMovedPermanently(f'{custom_location}/docs')
 
 
-application = falcon.App(
-    cors_enable=True,
-    sink_before_static_route=False
-)
+application = falcon.App(cors_enable=True, sink_before_static_route=False)
 application.req_options.strip_url_path_trailing_slash = True
 application.add_route(f'{custom_location}/vrp', VRPResource())
 application.add_route(f'{custom_location}/status', StatusResource())
@@ -319,9 +351,11 @@ swagger_parameters = {
     'layout': '"BaseLayout"',
     'presets': '[SwaggerUIBundle.presets.apis]',
 }
-falcon_api_doc(application,
-               parameters=swagger_parameters,
-               config_path='/app/html/openapi.yaml',
-               url_prefix=f'{custom_location}/docs',
-               title='RPKI History API')
+falcon_api_doc(
+    application,
+    parameters=swagger_parameters,
+    config_path='/app/html/openapi.yaml',
+    url_prefix=f'{custom_location}/docs',
+    title='RPKI History API',
+)
 application.add_sink(default_sink)

@@ -5,10 +5,18 @@ info:
     An API to query historical RPKI data, more specifically, Validated ROA Payloads
     (VRPs).
 
-    We obtain VRP data from the [RPKI Views](https://www.rpkiviews.org/) project and
-    store it in a compact form for fast access. From each dump we extract the
-    `output/rpki-client.csv` file, which contains just the VRPs, and update our
-    database.
+    We obtain VRP data from the [RPKI Views](https://www.rpkiviews.org/) project
+    and store it in a compact form for fast access. In 2026 a new and improved
+    dataformat
+    ([rpkispool](https://datatracker.ietf.org/doc/draft-snijders-rpkispool-format/))
+    based on [CCR
+    files](https://datatracker.ietf.org/doc/draft-ietf-sidrops-rpki-ccr/) was
+    introduced. Thus, the way we import data has changed over time. 
+    
+    #### Full Snapshots (until 2026)
+
+    From each dump we extract the `output/rpki-client.csv` file, which contains
+    just the VRPs, and update our database.
 
     A VRP entry consists of five fields:
 
@@ -23,11 +31,26 @@ info:
     visible.  Since most VRPs are stable, this allows us to update just the time range,
     keeping the database size compact.
 
+    #### rpkispool (from 2026)
+
+    Rpkispool files are created daily. Each file contains (amongst others) the
+    CCR files created by the different vantage points. Since the vantage points
+    create files at different frequencies, and can sometimes fail, we select the
+    vantage point that created the most CCR files for each day.
+    
+    We process the CCR files sequentially ordered by creation time using
+    [rpki-client](https://www.rpki-client.org/) with `-f` and `-j` parameters.
+    We extract the ROAPayloadState field that contains the VRPs. In CCR the
+    `max_length` field of a ROA can be absent, but for compatibility with the
+    previous format we set it to the prefix length in this case. The `visible`
+    time is handled the same.
+
     Data limitations:
 
-    * **High-frequency updates are invisible.** Currently, dumps are created roughly
-    every 20 minutes. If a VRP expires / is removed and potentially recreated between
-    dumps, this will not be reflected in the database.
+    * **High-frequency updates are invisible.** With full snapshots dumps are
+    created roughly every 20 minutes, with rpkispool more frequent. However, if
+    a VRP expires / is removed and potentially recreated between dumps, this
+    will not be reflected in the database.
 
     * **Data is at dump-time granularity.** If a VRP is created, expires, or is removed
     between dumps, the exact point in time is lost. For example, if there are two dumps
@@ -43,14 +66,19 @@ info:
     Data sources:
 
     * 2020-12-06 16:37:23 UTC to 2022-06-14 14:54:59 UTC:
-      [josephine.sobornost.net](https://josephine.sobornost.net/rpkidata/)
-    * 2022-06-14 15:08:09 UTC to now: [dango.attn.jp](https://dango.attn.jp/rpkidata/)
+    [josephine.sobornost.net](https://josephine.sobornost.net/rpkidata/)
+    * 2022-06-14 15:08:09 UTC to 2025-12-31 23:53:28 UTC:
+    [dango.attn.jp](https://dango.attn.jp/rpkidata/)
+    * 2026-01-01 00:00:34 UTC to now: Move to rpkispool format. Each day the
+    vantage point with the most CCR files is selected. Please refer to the
+    /status endpoint for details about which vantage point was used for a
+    specific time.
   contact:
     email: admin@ihr.live
   license:
     name: GPLv3
     url: https://www.gnu.org/licenses/gpl-3.0.en.html
-  version: 1.0.0
+  version: 1.1.0
 externalDocs:
   description: GitHub repository
   url: https://github.com/InternetHealthReport/rpki-history
@@ -240,10 +268,14 @@ paths:
 
         * `next` is the URL to the next page. It will be an empty string if there are no
         results left.
-        * `timestamp` refers to the dump time (taken from the filename).
+        * `dump_timestamp` refers to the dump time (taken from the filename).
+        * `ingest_timestamp` refers to the time this dump was imported.
         * `[deleted|updated|new]_vrps` indicates the number of VRPs differing from the
         previous dump. Note that deleted refers to a VRP that was present in the
         previous dump, but not in the current one.
+        * `vp` is the RPKIviews vantage point that created the dump.
+        * `vp_type` is the type of the vantage point. Historical dumps are based
+        on full snapshots, newer dumps use the rpkispool format.
       parameters:
         - name: page
           in: query
@@ -289,7 +321,9 @@ paths:
                     items:
                       type: object
                       properties:
-                        timestamp:
+                        dump_timestamp:
+                          $ref: "#/components/schemas/IsoDateTime"
+                        ingest_timestamp:
                           $ref: "#/components/schemas/IsoDateTime"
                         deleted_vrps:
                           type: integer
@@ -303,11 +337,22 @@ paths:
                           type: integer
                           format: int32
                           minimum: 0
+                        vp:
+                          type: string
+                          example: dango.attn.jp
+                        vp_type:
+                          type: string
+                          enum:
+                            - full_snapshot
+                            - rpkispool
                       required:
-                        - timestamp
+                        - dump_timestamp
+                        - ingest_timestamp
                         - deleted_vrps
                         - unchanged_vrps
                         - new_vrps
+                        - vp
+                        - vp_type
                 required:
                   - next
                   - results
@@ -347,7 +392,7 @@ components:
           format: date-time
           # This needs to be quoted, else it will be recognized as a datetime, which
           # breaks Falcon at the moment.
-          example: "1970-01-01T00:00:00"
+          example: "1970-01-01T00:00:00+00:00"
   responses:
     InvalidMissingParameter:
       description: Invalid or missing parameter
