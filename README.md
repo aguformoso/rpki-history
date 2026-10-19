@@ -1,15 +1,25 @@
 # RPKI History
 
-An API to query historical RPKI data, more specifically, Validated ROA Payloads (VRPs).
+An API to query historical RPKI data, more specifically, Validated ROA Payloads
+(VRPs).
 
 Links:
 
 * [GitHub](https://github.com/InternetHealthReport/rpki-history)
 * [API](https://www.ihr.live/rpki-history/api/)
 
-We obtain VRP data from the [RPKI Views](https://www.rpkiviews.org/) project and store
-it in a compact form for fast access. From each dump we extract the
-`output/rpki-client.csv` file, which contains just the VRPs, and update our database.
+We obtain VRP data from the [RPKI Views](https://www.rpkiviews.org/) project and
+store it in a compact form for fast access. In 2026 a new and improved
+dataformat
+([rpkispool](https://datatracker.ietf.org/doc/draft-snijders-rpkispool-format/))
+based on [CCR
+files](https://datatracker.ietf.org/doc/draft-ietf-sidrops-rpki-ccr/) was
+introduced. Thus, the way we import data has changed over time.
+
+#### Full Snapshots (until 2026)
+
+From each dump we extract the `output/rpki-client.csv` file, which contains just
+the VRPs, and update our database.
 
 A VRP entry consists of five fields:
 
@@ -18,34 +28,55 @@ ASN,IP Prefix,Max Length,Trust Anchor,Expires
 AS13335,1.0.0.0/24,24,apnic,1753280249
 ```
 
-We ignore the expiry time and only work on dump-time granularity. For each ingested dump
-we compare the set of VRPs (in form of `asn, prefix, max_length`) with the previous
-dump. Each VRP has a `visible` time range, during which is was continuously visible.
-Since most VRPs are stable, this allows us to update just the time range, keeping the
-database size compact.
+We ignore the expiry time and only work on dump-time granularity. For each
+ingested dump we compare the set of VRPs (in form of `asn, prefix, max_length`)
+with the previous dump. Each VRP has a `visible` time range, during which is was
+continuously visible.  Since most VRPs are stable, this allows us to update just
+the time range, keeping the database size compact.
+
+#### rpkispool (from 2026)
+
+Rpkispool files are created daily. Each file contains (amongst others) the CCR
+files created by the different vantage points. Since the vantage points create
+files at different frequencies, and can sometimes fail, we select the vantage
+point that created the most CCR files for each day.
+
+We process the CCR files sequentially ordered by creation time using
+[rpki-client](https://www.rpki-client.org/) with `-f` and `-j` parameters.  We
+extract the ROAPayloadState field that contains the VRPs. In CCR the
+`max_length` field of a ROA can be absent, but for compatibility with the
+previous format we set it to the prefix length in this case. The `visible` time
+is handled the same.
 
 Data limitations:
 
-* **High-frequency updates are invisible.** Currently, dumps are created roughly
-every 20 minutes. If a VRP expires / is removed and potentially recreated between dumps,
-this will not be reflected in the database.
+* **High-frequency updates are invisible.** With full snapshots dumps are
+created roughly every 20 minutes, with rpkispool more frequent. However, if a
+VRP expires / is removed and potentially recreated between dumps, this will not
+be reflected in the database.
 
-* **Data is at dump-time granularity.** If a VRP is created, expires, or is removed
-between dumps, the exact point in time is lost. For example, if there are two dumps at
-time `A` and `C`, a VRP expires at time `B` (`A < B < C`), and a user queries for
-timestamp `D` (`A < D < B`) then the query will not find the VRP, since its visibility
-ended at `A`. Similarly, VRPs that are only visible in one dump will have equal values
-for the start and end visibility time.
+* **Data is at dump-time granularity.** If a VRP is created, expires, or is
+* removed
+between dumps, the exact point in time is lost. For example, if there are two
+dumps at time `A` and `C`, a VRP expires at time `B` (`A < B < C`), and a user
+queries for timestamp `D` (`A < D < B`) then the query will not find the VRP,
+since its visibility ended at `A`. Similarly, VRPs that are only visible in one
+dump will have equal values for the start and end visibility time.
 
-* **Queryable time range is limited.** Naturally, we are limited by the amount of
-available data. Trying queries outside of the available time range will result in an
-error (to distinguish from non-existent VRPs).
+* **Queryable time range is limited.** Naturally, we are limited by the amount
+* of
+available data. Trying queries outside of the available time range will result
+in an error (to distinguish from non-existent VRPs).
 
 Data sources:
 
 * 2020-12-06 16:37:23 UTC to 2022-06-14 14:54:59 UTC:
-  [josephine.sobornost.net](https://josephine.sobornost.net/rpkidata/)
-* 2022-06-14 15:08:09 UTC to now: [dango.attn.jp](https://dango.attn.jp/rpkidata/)
+[josephine.sobornost.net](https://josephine.sobornost.net/rpkidata/)
+* 2022-06-14 15:08:09 UTC to 2025-12-31 23:53:28 UTC:
+[dango.attn.jp](https://dango.attn.jp/rpkidata/)
+* 2026-01-01 00:00:34 UTC to now: Move to rpkispool format. Each day the
+vantage point with the most CCR files is selected. Please refer to the /status
+endpoint for details about which vantage point was used for a specific time.
 
 ## Endpoints
 
@@ -166,10 +197,13 @@ Optional:
   "next": "https://www.ihr.live/rpki-history/api/metadata?page_size=1000&page=2",
   "results": [
     {
-      "timestamp": "2020-12-06T16:37:23+00:00",
+      "dump_timestamp": "2020-12-06T16:37:23+00:00",
+      "ingest_timestamp": "2026-10-10T06:23:54+00:00",
       "deleted_vrps": 0,
       "unchanged_vrps": 0,
-      "new_vrps": 205850
+      "new_vrps": 205850,
+      "vp": "josephine.sobornost.net",
+      "vp_type": "full_snapshot"
     },
     // ...
   ]
@@ -179,11 +213,18 @@ Optional:
 `next` is the URL to the next page. It will be an empty string if there are no results
 left.
 
-`timestamp` refers to the dump time (taken from the filename).
+`dump_timestamp` refers to the dump time (taken from the filename).
+
+`ingest_timestamp` refers to the time this dump was imported.
 
 `[deleted|updated|new]_vrps` indicates the number of VRPs differing from the previous
 dump. Note that `deleted` refers to a VRP that was present in the previous dump, but not
 in the current one.
+
+`vp` is the RPKIviews vantage point that created the dump.
+
+`vp_type` is the type of the vantage point. Historical dumps are based on full
+snapshots, newer dumps use the rpkispool format.
 
 ## Database Dump
 
