@@ -1,6 +1,6 @@
 import ipaddress
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import falcon
 import psycopg
@@ -334,6 +334,38 @@ class MetadataResource:
             resp.media = {'next': next_uri, 'results': formatted_results}
 
 
+class LatestMetadataResource:
+    def __init__(self) -> None:
+        self.conn = psycopg.connect(
+            host=db_host, dbname=db_dbname, user=db_user, password=db_password, autocommit=True
+        )
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response):
+        """Return the earliest and latest imported dump times as well as an
+        estimate of the number of processed CCR files in the latest
+        rpkispool."""
+        with self.conn.cursor() as c:
+            earliest, latest = get_available_dump_time_range(c)
+            if earliest is None or latest is None:
+                resp.media = {'earliest': None, 'latest': None, 'processed_ccr_files': 0}
+                return
+            check_interval_start = latest - timedelta(days=1)
+            c.execute(
+                """
+                SELECT COUNT(*)
+                FROM metadata_view
+                WHERE dump_time >= %s
+            """,
+                (check_interval_start,),
+            )
+            processed_ccr_files = next(c)[0]
+        resp.media = {
+            'earliest': earliest.isoformat(),
+            'latest': latest.isoformat(),
+            'processed_ccr_files': processed_ccr_files,
+        }
+
+
 def default_sink(req: falcon.Request, resp: falcon.Response, **kwargs):
     """Redirect all unknown paths to the documentation."""
     raise falcon.HTTPMovedPermanently(f'{custom_location}/docs')
@@ -344,6 +376,7 @@ application.req_options.strip_url_path_trailing_slash = True
 application.add_route(f'{custom_location}/vrp', VRPResource())
 application.add_route(f'{custom_location}/status', StatusResource())
 application.add_route(f'{custom_location}/metadata', MetadataResource())
+application.add_route(f'{custom_location}/metadata/latest', LatestMetadataResource())
 
 swagger_parameters = {
     'deepLinking': 'false',
